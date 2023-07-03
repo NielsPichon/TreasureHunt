@@ -1,0 +1,180 @@
+#pragma kernel DisplacedGridSampler
+#pragma kernel ClosestPointOnDisplacedGrid
+#pragma kernel PixelPieSampler
+#pragma kernel MasksFromRegions
+
+# define THREAD_GROUP_SIZE 64
+
+
+RWStructuredBuffer<float2> points;
+
+int numPoints = 10;
+float seed = 0.0f;
+float gridDistortion = 1.0f;
+
+// buffer for the closest point to any given pixel
+RWStructuredBuffer<int> closestPoint;
+// distance to the closest point
+RWStructuredBuffer<float> distanceToCenter;
+// Idx of the property assigned to each element of the buffer
+RWStructuredBuffer<int> regions;
+int size = 512; // width of a map
+float zoom = 1.0f;
+float2 offset = float2(0.0f, 0.0f);
+
+// number of properties to assign to regions
+uint numProperties = 4;
+float samplerNoiseFreq = 30.0f;
+float samplerNoiseFactor = 0.1f;
+
+// buffers for the masks
+RWStructuredBuffer<float> mask; // buffer of size * size * numProperties. We use
+                                // floats as buffers must have a stride that is
+                                // a multiple of 4 which excludes bools and
+                                // float will make it easier to blur
+
+
+// Random number generator stupidly hand made and probably poorly behaved
+float random1D(float p) {
+    p = frac(p * 18.3564893);
+    p = p + dot(float2(p, p), float2(127.1, 311.7));
+    p += p * p;
+    return frac(sin(p * 18.3564893 * 3.147));
+}
+
+// 2D Noise based on Morgan McGuire @morgan3d
+// https://www.shadertoy.com/view/4dS3Wd
+float random2d (float2 id, float seed) {
+    // float3 p3 = frac(float3(id.xy, id.x) * 0.13);
+    // p3 += dot(p3 + seed, p3.yzx + 3.333);
+    // return frac((p3.x + p3.y) * p3.z);
+    return frac(
+        sin(dot(id.xy, float2(12.9898,78.233))) * (43758.5453123 + seed));
+}
+
+
+float noise (float2 id, float seed) {
+    float2 i = floor(id);
+    float2 f = frac(id);
+
+    // Four corners in 2D of a tile
+    float a = random2d(i, seed);
+    float b = random2d(i + float2(1.0, 0.0), seed);
+    float c = random2d(i + float2(0.0, 1.0), seed);
+    float d = random2d(i + float2(1.0, 1.0), seed);
+
+    // Smooth Interpolation
+
+    // Cubic Hermine Curve.  Same as SmoothStep()
+    float2 u = f * f * (3.0 - 2.0 * f);
+
+    // Mix 4 coorners percentages
+    return (lerp(a, b, u.x) +
+            (c - a) * u.y * (1.0 - u.x) +
+            (d - b) * u.x * u.y);
+}
+
+
+// Sample a grid of points, then displace them by a noise function.
+// While this will not guarantee that the points are at least a given distance
+// away from each other, it does maintain a grid like structure for fast queries
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void DisplacedGridSampler (uint3 id : SV_DispatchThreadID)
+{
+    if (id.x >= uint(numPoints * numPoints)) {
+        return;
+    }
+
+    float spacing = 1.0f / float(numPoints);
+    float remainder = spacing * 0.5f;
+
+    // compute the coordinates of the point
+    uint2 uv = uint2(id.x / numPoints, id.x % numPoints);
+    float2 coords = float2(uv) * spacing + remainder / 2.0f;
+
+    // displace the point
+    float noiseVal = random1D(seed + id.x);
+    float2 direction = float2(
+        cos(noiseVal * 10 * 3.14159 + 18.3564),
+        sin(noiseVal * 10 * 3.14159 + 18.3564)
+    );
+    float amplitude = random1D(noiseVal);
+    float2 displacedCoords = (
+        coords + direction * amplitude * spacing * 0.5f * gridDistortion);
+
+    points[id.x] = displacedCoords;
+}
+
+// This version accounts for the edge vertices being out of the tile
+// (which will prove useful for computing normals later on)
+float2 getCoordsWithOffset(
+        uint id, int bufferSize, float2 position, float zoomLevel) {
+    int2 uvs = int2(floor(id / bufferSize) - 1, id % bufferSize - 1);
+    float2 coords = float2(uvs) / (float(bufferSize) - 3.0f);
+    return coords / zoomLevel + position;
+}
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ClosestPointOnDisplacedGrid (uint3 id : SV_DispatchThreadID)
+{
+    float2 coords = getCoordsWithOffset(id.x, size, offset, zoom);
+    coords = clamp(coords, 0.0f, 1.0f);
+
+    float spacing = 1.0f / float(numPoints);
+
+    // retrieve all the possible grid points in a viscinity given the
+    // coordinates of the pixel
+    int2 gridCoords = int2(floor(coords / spacing));
+
+    // we displace the point to get a noisier boundary
+    float noiseVal = noise(coords * samplerNoiseFreq, seed);
+    float2 direction = float2(
+        cos(noiseVal * 3.14159 + 18.3564),
+        sin(noiseVal * 3.14159 + 18.3564)
+    );
+    coords += direction * noiseVal * spacing * samplerNoiseFactor;
+
+    // compute the distance to each point
+    float minDist = 10000.0f;
+    int closest = -1;
+    for (int i = -1; i < 2; i++) {
+        if (gridCoords.x + i < 0 || gridCoords.x + i >= numPoints) {
+            continue;
+        }
+        for (int j = -1; j < 2; j++) {
+            if (gridCoords.y + j < 0 || gridCoords.y + j >= numPoints) {
+                continue;
+            }
+            int idx = (gridCoords.x + i) * numPoints + gridCoords.y + j;
+            float d = distance(
+                coords,
+                points[idx]
+            );
+            if (d < minDist) {
+                minDist = d;
+                closest = idx;
+            }
+        }
+    }
+
+    closestPoint[id.x] = closest;
+    distanceToCenter[id.x] = minDist;
+    regions[id.x] = uint(
+        floor(random1D(seed + float(closest)) * numProperties));
+}
+
+
+// Proper poisson disc sampling using
+// https://www.cs.umd.edu/gvil/projects/pixelpie.shtml
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void PixelPieSampler(uint3 id: SV_DispatchThreadID)
+{
+    // TODO: Implement me
+}
+
+// Converts a list of regions into a list of masks
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void MasksFromRegions(uint3 id: SV_DispatchThreadID) {
+    mask[id.x + regions[id.x] * size * size] = 1.0f;
+}

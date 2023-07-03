@@ -1,0 +1,72 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel UVSpace
+#pragma kernel HeightMap
+#pragma kernel RandomRegion
+#pragma kernel RandomRegionFloat
+
+#define THREAD_GROUP_SIZE 8
+
+// Create a RenderTexture with enableRandomWrite flag and set it
+// with cs.SetTexture
+RWTexture2D<float4> Result;
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, 1)]
+void UVSpace (uint3 id : SV_DispatchThreadID)
+{
+    float width, height;
+    Result.GetDimensions(width, height);
+    float2 uv = id.xy / float2(width, height);
+
+    Result[id.xy] = float4(uv.x, uv.y, 0.0, 1.0);
+}
+
+RWStructuredBuffer<float> heightMap;
+int size;
+float maxHeight;
+
+[numthreads(THREAD_GROUP_SIZE,THREAD_GROUP_SIZE,1)]
+void HeightMap (uint3 id : SV_DispatchThreadID)
+{
+    float width, height;
+    Result.GetDimensions(width, height);
+    float2 uv = id.yx / float2(width, height);
+
+    int idx = floor(uv.x * size + uv.y * size * size);
+    float val = heightMap[idx] / maxHeight;
+    Result[id.xy] = float4(val, val, val, 1.0);
+}
+
+
+float3 randomColor(float idx)
+{
+    return float3(
+        cos(idx * 18.32566 * 3.1415926),
+        sin(idx * 14.25653 * 3.1415926 + 45.2564),
+        cos(idx * 12.25653 * 3.1415926 + 90.2564)
+    );
+}
+
+// region associated to each pixel
+RWStructuredBuffer<int> region;
+
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, 1)]
+void RandomRegion(uint3 id : SV_DispatchThreadID)
+{
+    float width, height;
+    Result.GetDimensions(width, height);
+    float3 color = randomColor(float(region[id.x * size + id.y]));
+
+    Result[id.xy] = float4(color, 1.0);
+}
+
+
+RWStructuredBuffer<float> regionFloat;
+[numthreads(THREAD_GROUP_SIZE, THREAD_GROUP_SIZE, 1)]
+void RandomRegionFloat(uint3 id : SV_DispatchThreadID)
+{
+    float width, height;
+    Result.GetDimensions(width, height);
+    float3 color = randomColor(regionFloat[id.x * size + id.y]);
+
+    Result[id.xy] = float4(color, 1.0);
+}

@@ -1,0 +1,125 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel GenerateMesh
+// #pragma kernel SmoothEdges
+
+# define THREAD_GROUP_SIZE 64
+
+struct Vertex{
+    float3 position;
+    float2 uv;
+    float3 normal;
+};
+
+RWStructuredBuffer<float> heightMap;
+RWStructuredBuffer<Vertex> vertices;
+RWStructuredBuffer<int> tris;
+
+uint size;
+uint width;
+
+void ComputeNormal(uint heightId, uint vtxId, float offset = 1.0f) {
+    // get vertices surrounding the current vtx
+    float3 p1 = float3(0, heightMap[heightId], 0);
+    float3 p2 = float3(0, heightMap[heightId + size], offset);
+    float3 p3 = float3(0, heightMap[heightId - size], -offset);
+    float3 p4 = float3(offset, heightMap[heightId + 1], 0);
+    float3 p5 = float3(-offset, heightMap[heightId - 1], 0);
+
+    // compute edges
+    float3 e1 = p2 - p1; // up
+    float3 e2 = p3 - p1; // down
+    float3 e3 = p4 - p1; // right
+    float3 e4 = p5 - p1; // left
+
+    // compute normals
+    float3 normal = float3(0, 0, 0);
+    normal += cross(e3, e1);
+    normal += cross(e1, e4);
+    normal += cross(e4, e2);
+    normal += cross(e2, e3);
+
+    // normalize
+    vertices[vtxId].normal = normalize(normal);
+}
+
+void SetVertex(uint vtxId, uint heighIdx, float2 coord, int bufferSize){
+    coord /= float(bufferSize - 1);
+    vertices[vtxId].uv = coord;
+    vertices[vtxId].position = float3(coord.x * width - width * 0.5f,
+                                      heightMap[heighIdx],
+                                      coord.y * width - width * 0.5f);
+    ComputeNormal(heighIdx, vtxId, 1.0f / float(bufferSize + 1));
+}
+
+void CreateVertex(uint3 id) {
+    uint2 coord = uint2(floor(id.x / size), id.x % size);
+
+    // don't create vertices on the first and last column and rows
+    // because these are only used for normals calculation
+    if (
+        coord.x == 0 || coord.x == size - 1
+        || coord.y == 0 || coord.y == size - 1
+    ) {
+        return;
+    }
+
+    coord -= uint2(1, 1);
+    uint vtxIdx = coord.y + coord.x * (size - 2);
+    SetVertex(vtxIdx, id.x, float2(coord), size - 2);
+}
+
+void CreateTriangle(uint3 id, uint tileSize) {
+    // don't create triangles on the last column
+    // and row of vertices
+    uint lineIdx = floor(id.x / tileSize);
+    if (id.x % tileSize == tileSize - 1) return;
+    if (lineIdx == tileSize - 1) return;
+
+    // first triangle
+    tris[6 * (id.x - lineIdx)] = id.x;
+    tris[6 * (id.x - lineIdx) + 1] = id.x + 1;
+    tris[6 * (id.x - lineIdx) + 2] = id.x + tileSize;
+
+    // first triangle
+    tris[6 * (id.x - lineIdx) + 3] = id.x + 1;
+    tris[6 * (id.x - lineIdx) + 4] = id.x + tileSize + 1;
+    tris[6 * (id.x - lineIdx) + 5] = id.x + tileSize;
+}
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void GenerateMesh (uint3 id : SV_DispatchThreadID)
+{
+    CreateVertex(id);
+    CreateTriangle(id, size - 2);
+}
+
+
+// [numthreads(THREAD_GROUP_SIZE, 1, 1)]
+// void SmoothEdges (uint3 id : SV_DispatchThreadID)
+// {
+//     int lineIdx = floor(id.x / size);
+
+//     // don't smooth edges on the last column
+//     // and row of vertices
+//     if (id.x % size == size - 1 || id.x % size == 0) return;
+//     if (lineIdx == size - 1 || lineIdx == 0) return;
+
+//     int3x3 neighbours = int3x3(0,0,0,
+//                                0,1,0,
+//                                0,0,0);
+//     // We find all vertices that are on the same height
+//     for (int i = -1; i < 2; i++) {
+//         for (int j = -1; j < 2; j++){
+//             if (i == 0 && j == 0) continue;
+//             if (
+//                 vertices[id.x].position.y
+//                 == vertices[id.x + i + j * size].position.y
+//             ){
+//                 neighbours[i + 1][j + 1] = 1;
+//             }
+//         }
+//     }
+
+//     // TODO: Implement this
+// }

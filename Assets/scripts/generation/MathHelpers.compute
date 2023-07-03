@@ -1,0 +1,190 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel ComputeEDT
+#pragma kernel Normalize
+#pragma kernel MaxReduce
+#pragma kernel GaussianBlur1D
+#pragma kernel AppendBuffer
+#pragma kernel MixBuffers
+#pragma kernel MixBuffersInplace
+
+
+# define THREAD_GROUP_SIZE 64
+
+
+// edt
+RWStructuredBuffer<float> mask;
+RWStructuredBuffer<float> distanceFieldIn;
+RWStructuredBuffer<float> distanceFieldOut;
+int size;
+
+// max reduce
+RWStructuredBuffer<float> inputBuffer;
+RWStructuredBuffer<float> outputBuffer;
+groupshared float sharedBuffer[THREAD_GROUP_SIZE];
+
+// normalize
+// The first value should be the max. We
+// use a buffer to avoid having to pass
+// a float as a kernel argument which would entail moving the max
+// reduce result to host
+RWStructuredBuffer<float> maxBuffer;
+
+// gaussian blur
+int axis = 0;
+
+// append buffer and gaussian blur
+int offset = 0;
+
+// mix buffers
+RWStructuredBuffer<float> bufferA;
+RWStructuredBuffer<float> bufferB;
+
+
+int getDist(uint idx, float minDist, int dist, out bool shouldBreak) {
+    if (mask[idx] > 0.5) {
+        shouldBreak = true;
+        return min(minDist, dist);
+    }
+    if (distanceFieldIn[idx] < size) {
+        shouldBreak = true;
+        return min(minDist, distanceFieldIn[idx] + 1);
+    }
+
+    shouldBreak = false;
+    return minDist;
+}
+
+// TODO: Optimize this kernel which is brute force for each pixel
+//(that's O(size) ops which is a lot)
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ComputeEDT (uint3 id : SV_DispatchThreadID)
+{
+    if (mask[id.x] > 0.5) {
+        distanceFieldOut[id.x] = 0;
+        return;
+    }
+
+    int2 pos = int2(floor(id.x / size), id.x % size);
+    float minDist = distanceFieldIn[id.x];
+    bool shouldBreak = false;
+    for (int i = 1; i < size; i++) {
+        if (pos.x - i >= 0) {
+            minDist = getDist(id.x - i * size, minDist, i, shouldBreak);
+        }
+        if (pos.x + i < size ) {
+            minDist = getDist(id.x + i * size, minDist, i, shouldBreak);
+        }
+        if (pos.y - i >= 0) {
+            minDist = getDist(id.x - i, minDist, i, shouldBreak);
+        }
+        if (pos.y + i < size) {
+            minDist = getDist(id.x + i, minDist, i, shouldBreak);
+        }
+        if (shouldBreak) {
+            break;
+        }
+    }
+
+    distanceFieldOut[id.x] = minDist;
+}
+
+
+// We compute the max over the threads in a group
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void MaxReduce(uint3 id : SV_DispatchThreadID,
+               uint3 groupThreadId : SV_GroupThreadID,
+               uint3 groupId : SV_GroupID)
+{
+    // Copy data from input buffer to shared memory
+    sharedBuffer[groupThreadId.x] = inputBuffer[id.x];
+    GroupMemoryBarrierWithGroupSync();
+
+
+    // Perform parallel reduction
+    // Each group thread is going to look at the element it is at and the one
+    // which is half a group size away, and then we recursively reduce the
+    // lookup size by half
+    for (uint stride = THREAD_GROUP_SIZE / 2; stride > 0; stride >>= 1)
+    {
+        if (groupThreadId.x < stride)
+        {
+            sharedBuffer[groupThreadId.x] = max(
+                sharedBuffer[groupThreadId.x],
+                sharedBuffer[groupThreadId.x + stride]
+            );
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    if (groupThreadId.x == 0) {
+        outputBuffer[groupId.x] = sharedBuffer[0];
+    }
+}
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void Normalize (uint3 id : SV_DispatchThreadID)
+{
+    if (maxBuffer[0] == 0) {
+        return;
+    }
+    inputBuffer[id.x] /= maxBuffer[0];
+}
+
+# define kernelSize 5
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void GaussianBlur1D (uint3 id : SV_DispatchThreadID)
+{
+    uint2 uvs = uint2(floor(id.x / size), id.x % size);
+
+    float sum = 0;
+    float kernelTot = 0;
+
+    float two_sigma_2 = 5 * kernelSize * kernelSize;
+    // sigma if half the kenerl size
+    float weight = 1.0 / sqrt(3.14 * two_sigma_2);
+
+    for (int i = -kernelSize / 2; i <= kernelSize / 2; i++) {
+        // we only implement border zero mode granted there will be a lot
+        // of water around the border
+        if (int(uvs[axis]) + i < 0 || int(uvs[axis]) + i >= size) {
+            continue;
+        }
+
+        uint uvs2[] = {uvs.x, uvs.y};
+        uvs2[axis] += i;
+        float gauss = weight * exp(-i * i / (two_sigma_2));
+        sum += (
+            inputBuffer[uvs2[0] * size + uvs2[1] + offset * size * size] * gauss
+        );
+        kernelTot += gauss;
+    }
+
+    sum /= kernelTot;
+
+    outputBuffer[id.x] = sum;
+}
+
+
+// Concatenates a buffer to another one
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void AppendBuffer(uint3 id : SV_DispatchThreadID)
+{
+    outputBuffer[id.x + size * offset] = inputBuffer[id.x];
+}
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void MixBuffers(uint3 id : SV_DispatchThreadID)
+{
+    float m = mask[id.x + size * size * offset];
+    outputBuffer[id.x] = bufferA[id.x] * (1 - m) + m * bufferB[id.x];
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void MixBuffersInplace(uint3 id : SV_DispatchThreadID)
+{
+    float m = mask[id.x + size * size * offset];
+    bufferA[id.x] = bufferA[id.x] * (1 - m) + m * bufferB[id.x];
+}

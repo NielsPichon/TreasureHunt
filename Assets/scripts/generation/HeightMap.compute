@@ -1,0 +1,291 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel HeightMap
+#pragma kernel MaskedHeightMap
+#pragma kernel Leveling
+#pragma kernel MakeIslandMask
+#pragma kernel ApplyDistanceField
+#pragma kernel ApplyWaterMask
+#pragma kernel ApplyShapingFunction
+#pragma kernel GenerateRiver
+#pragma kernel GenerateShoreMask
+
+
+# define THREAD_GROUP_SIZE 64
+
+
+RWStructuredBuffer<float> heightMap;
+
+int size = 1024;
+float zoom = 1.0f;
+float2 offset = float2(0.0f, 0.0f); // in [0, 1] range
+
+// base noise params
+int octaves = 1; // how many layers of noise
+float scale = 5.0f; // base frequency
+float lacunarity = 2.0f; // how fast the noise freq grows
+float persistence = 0.5f; // how fast the noise decays
+float seed = 0.0f;
+float levelHeight = 1.0f;
+
+StructuredBuffer<float> shapingFunction;
+
+// leveling tools
+float maxHeight = 10.0;
+
+// island maker
+int waterMaskSize = 1024; // the water mask is for the whole map
+float islandNoiseScale = 1.0; // scale of the noise added to the island radius
+float islandRoundness = 0.5; // how round the island is. In range [0, 1]
+RWStructuredBuffer<float> waterMask; // binary waterMask for the island
+
+// distance field
+RWStructuredBuffer<float> distanceField;
+float distanceFieldEffect = 0.3f;
+
+// river
+float riverWidth = 0.01f;
+
+float riverNoiseScale = 10.0f;
+float riverNoiseAmount = 0.2f;
+
+float2 start = float2(0.0f, 0.5f);
+float2 center = float2(0.5f, 0.5f);
+float2 end = float2(0.5f, 0.0f);
+
+// shore mask
+RWStructuredBuffer<float> shoreMask;
+
+
+float2 getCoords(uint id, int bufferSize, float2 position, float zoomLevel) {
+    return (
+        float2(floor(id / bufferSize), id % bufferSize)
+        / ((float)bufferSize - 1)
+        / zoomLevel
+        + position
+    );
+}
+
+// This version accounts for the edge vertices being out of the tile
+// (which will prove useful for computing normals later on)
+float2 getCoordsWithOffset(
+        uint id, int bufferSize, float2 position, float zoomLevel) {
+    int2 uvs = int2(floor(id / bufferSize) - 1, id % bufferSize - 1);
+    float2 coords = float2(uvs) / (float(bufferSize) - 3.0f);
+    return coords / zoomLevel + position;
+}
+
+// 2D Noise based on Morgan McGuire @morgan3d
+// https://www.shadertoy.com/view/4dS3Wd
+float random (float2 id, float seed) {
+    // float3 p3 = frac(float3(id.xy, id.x) * 0.13);
+    // p3 += dot(p3 + seed, p3.yzx + 3.333);
+    // return frac((p3.x + p3.y) * p3.z);
+    return frac(
+        sin(dot(id.xy, float2(12.9898,78.233))) * (43758.5453123 + seed));
+}
+
+
+float noise (float2 id, float seed) {
+    float2 i = floor(id);
+    float2 f = frac(id);
+
+    // Four corners in 2D of a tile
+    float a = random(i, seed);
+    float b = random(i + float2(1.0, 0.0), seed);
+    float c = random(i + float2(0.0, 1.0), seed);
+    float d = random(i + float2(1.0, 1.0), seed);
+
+    // Smooth Interpolation
+
+    // Cubic Hermine Curve.  Same as SmoothStep()
+    float2 u = f * f * (3.0 - 2.0 * f);
+
+    // Mix 4 coorners percentages
+    return (lerp(a, b, u.x) +
+            (c - a) * u.y * (1.0 - u.x) +
+            (d - b) * u.x * u.y);
+}
+
+
+float interpolate(
+    uint id,
+    float2 position,
+    float zoomLevel,
+    int baseSize,
+    int tgtSize,
+    RWStructuredBuffer<float> buffer
+) {
+    float2 coords = getCoordsWithOffset(id.x, baseSize, position, zoomLevel);
+    // make sure that coordinates outside the buffer also read inside the buffer
+    coords = clamp(coords, 0.0f, baseSize - 1);
+    coords *= tgtSize;
+
+    float2 low = floor(coords);
+    float2 high = clamp(low + 1, 0, tgtSize - 1);
+    float a = buffer[int(low.x * tgtSize + low.y)];
+    float b = buffer[int(low.x * tgtSize + high.y)];
+    float c = buffer[int(high.x * tgtSize + low.y)];
+    float d = buffer[int(high.x * tgtSize + high.y)];
+
+    float2 t = frac(coords);
+
+    float lowVal = lerp(a, b, t.y);
+    float highVal = lerp(c, d, t.y);
+
+    return lerp(lowVal, highVal, t.x);
+}
+
+
+float interpolateNearest(
+    uint id,
+    float2 position,
+    float zoomLevel,
+    int baseSize,
+    int tgtSize,
+    RWStructuredBuffer<float> buffer
+) {
+    float2 coords = getCoordsWithOffset(id.x, baseSize, position, zoomLevel);
+    // make sure that coordinates outside the buffer also read inside the buffer
+    coords = clamp(coords, 0.0f, baseSize - 1);
+    coords *= tgtSize;
+    coords = round(coords);
+    return buffer[int(coords.x * tgtSize + coords.y)];
+}
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void HeightMap (uint3 id : SV_DispatchThreadID)
+{
+    float2 coord = getCoordsWithOffset(id.x, size, offset, zoom);
+    float value = 0;
+
+    float amplitude = 1.0;
+    float totScale = scale;
+    float totAmp = 0.0;
+    for (int i = 0; i < octaves; i++) {
+        totAmp += amplitude;
+        value += noise(coord * totScale, seed) * amplitude;
+        amplitude *= persistence;
+        totScale *= lacunarity;
+    }
+
+    heightMap[id.x] = value / totAmp * maxHeight;
+}
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void MaskedHeightMap (uint3 id : SV_DispatchThreadID)
+{
+    float2 coord = getCoordsWithOffset(id.x, size, offset, zoom);
+    float value = 0;
+
+    float amplitude = 1.0;
+    float totScale = scale;
+    float totAmp = 0.0;
+
+    float maskVal = interpolate(
+        id.x, offset, zoom, size, waterMaskSize, distanceField);
+
+    for (int i = 0; i < octaves; i++) {
+        totAmp += amplitude;
+        value += noise(coord * totScale, seed) * amplitude * maskVal;
+        amplitude *= persistence;
+        totScale *= lacunarity;
+        if (amplitude < 0.01 * totAmp) {
+            // binarize mask for higher octaves such that
+            // they can fully contribute
+            maskVal = maskVal > 0.0f ? 1.0f : 0.0f;
+        }
+    }
+
+    heightMap[id.x] = value / totAmp * maxHeight;
+}
+
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void Leveling(uint3 id : SV_DispatchThreadID)
+{
+    float2 coord = getCoordsWithOffset(id.x, size, offset, zoom);
+    float height = heightMap[id.x];
+    float level = floor(height / levelHeight) * levelHeight;
+    heightMap[id.x] = level;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void MakeIslandMask(uint3 id : SV_DispatchThreadID)
+{
+    float2 coord = getCoords(id.x, waterMaskSize, float2(0.0f, 0.0f), 1.0f);
+    coord -= 0.5;
+    float len = length(coord);
+    float dist = len * 2;
+    float threshold = (
+        1 - noise(coord * islandNoiseScale, seed) * (1 - islandRoundness));
+    waterMask[id.x] = step(threshold, dist);
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ApplyDistanceField(uint3 id : SV_DispatchThreadID) {
+    float val = interpolate(
+        id.x, offset, zoom, size, waterMaskSize, distanceField);
+    heightMap[id.x] = val * heightMap[id.x];
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ApplyWaterMask(uint3 id : SV_DispatchThreadID) {
+    float val = interpolate(
+        id.x, offset, zoom, size, waterMaskSize, distanceField);
+    val = val > 0.0f ? 1.0f : 0.0f;
+    heightMap[id.x] = val * heightMap[id.x];
+}
+
+float shapeLerp(float x) {
+    int idx = int(max(min(x * 100.0f, 99.0f), 0.0f));
+    int plusone = min(idx + 1, 99);
+
+    float a = shapingFunction[idx];
+    float b = shapingFunction[plusone];
+    return lerp(a, b, frac(x * 100.0f));
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void ApplyShapingFunction(uint3 id : SV_DispatchThreadID) {
+    heightMap[id.x] = shapeLerp(heightMap[id.x] / maxHeight) * maxHeight;
+}
+
+// TODO: find a less brute force implementation
+float DistanceToQuadraticBezier(float2 pos, int maskSize)
+{
+	float minDist = maskSize * maskSize;
+    for (int t = 0; t < 100; t++) {
+        float interp = float(t) / 100.0f;
+        float2 a = lerp(start, center, interp);
+        float2 b = lerp(center, end, interp);
+        float2 val = lerp(a, b, interp);
+        val += noise(val * riverNoiseScale, seed) * riverNoiseAmount;
+        float dist = length(val - pos);
+        if (dist < minDist) {
+            minDist = dist;
+        }
+    }
+
+    return minDist;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void GenerateRiver (uint3 id : SV_DispatchThreadID)
+{
+    float2 coords = getCoords(id.x, waterMaskSize, float2(0.0f, 0.0f), 1.0f);
+
+    waterMask[id.x] = (
+        1
+        - step(riverWidth, DistanceToQuadraticBezier(coords, waterMaskSize))
+        * (1 - waterMask[id.x])
+    );
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void GenerateShoreMask (uint3 id : SV_DispatchThreadID) {
+    float distance = interpolate(
+        id.x, offset, zoom, size, waterMaskSize, distanceField);
+    shoreMask[id.x] = shapeLerp(distance);
+}
